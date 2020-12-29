@@ -3,10 +3,10 @@ from transformers import BertTokenizer, BertForSequenceClassification, AdamW, ge
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset, random_split
 import random
 import numpy as np
-
+from tqdm import tqdm
 
 class Classifier:
-    def __init__(self, k, sentence_path, max_len, batch_size, epoch):
+    def __init__(self, k, sentence_path, max_len, batch_size, epoch, fp16=False):
         with open(sentence_path) as f:
             self.sentences = f.readlines()
         self.k = k
@@ -14,9 +14,23 @@ class Classifier:
         self.batch_size = batch_size
         self.max_len = max_len
         self.tokenizer = self.get_tokenizer()
-        self.model = self.get_model()
+        self.fp16 = fp16
         self.device = self.get_device()
+        self.model = self.get_model().to(self.device)
+        self.using_parallel_model = False
+        if torch.cuda.device_count()>1:
+            self.model = torch.nn.DataParallel(self.model, device_ids=list(range(torch.cuda.device_count())))
+            self.batch_size = batch_size * torch.cuda.device_count()
+            self.using_parallel_model = True
+        
         self.input_ids, self.attention_masks = self.prepare_data()
+        self.dataset = TensorDataset(self.input_ids, self.attention_masks)
+
+        self.dataloader = DataLoader(
+            self.dataset,
+            sampler=SequentialSampler(self.dataset),
+            batch_size=self.batch_size
+        )
         # self.entity_idx = self.get_entity_idx()
 
     @staticmethod
@@ -81,10 +95,22 @@ class Classifier:
         entity_idx = torch.Tensor(entity_idx)
         return entity_idx
 
-    def get_hidden_state(self):
-        self.model.to('cpu')
-        outputs = self.model(self.input_ids, self.attention_masks)
-        return outputs[1][-1].detach().numpy().flatten().reshape(self.input_ids.shape[0], -1)
+    def get_hidden_state(self, verbose=2):
+        self.model.eval()
+        dataiter = self.dataloader
+        if verbose>=2:
+            dataiter = tqdm(dataiter)
+        with torch.no_grad():
+            outputs = []
+            for x,a in dataiter:
+                x = x.to(device=self.device)
+                a = a.to(device=self.device)
+                outputs += [
+                    self.model(x, a)[1][-1].detach().cpu().numpy().flatten().reshape(x.shape[0], -1)
+                ]
+                if self.fp16:
+                    outputs[-1]=outputs[-1].astype('float16')
+        return np.vstack(outputs)
 
     def train(self, labels):
         labels = torch.tensor(labels).long()
@@ -133,6 +159,7 @@ class Classifier:
                                          token_type_ids=None,
                                          attention_mask=b_input_mask,
                                          labels=b_labels)
+            loss = loss.mean()
             total_train_loss += loss.item()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -157,7 +184,7 @@ class Classifier:
                                                token_type_ids=None,
                                                attention_mask=b_input_mask,
                                                labels=b_labels)
-            total_eval_loss += loss.item()
+            total_eval_loss += loss.mean().item()
             logits = logits.detach().cpu().numpy()
             label_ids = b_labels.to('cpu').numpy()
             total_eval_accuracy += self.flat_accuracy(logits, label_ids)
@@ -173,3 +200,10 @@ class Classifier:
         pred_flat = np.argmax(preds, axis=1).flatten()
         labels_flat = labels.flatten()
         return np.sum(pred_flat == labels_flat) / len(labels_flat)
+
+    def save(self,path):
+        modeltosave = self.model.module if self.using_parallel_model else self.model
+        modeltosave.save_pretrained(path)
+        self.tokenizer.save_pretrained(path)
+        
+

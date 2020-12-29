@@ -1,8 +1,9 @@
-batch_size: 64
-k: 50
-cluster: 'kmeans'
-# cluster: adpative_clustering
+fp16: 1
+batch_size: 16
+k: 20
+cluster: 'minibatchkmeans'
 loop: 5
 epoch: 4
-sentence_path: 'data/sentence'
+sentence_path: 'data/triples.txt'
 bert_max_len: 128
+save_path: output
