@@ -8,7 +8,7 @@ from tqdm import tqdm
 class Classifier:
     def __init__(self, k, sentence_path, max_len, batch_size, epoch, fp16=False):
         with open(sentence_path) as f:
-            self.sentences = f.readlines()
+            sentences = f.readlines()
         self.k = k
         self.epoch = epoch
         self.batch_size = batch_size
@@ -23,15 +23,14 @@ class Classifier:
             self.batch_size = batch_size * torch.cuda.device_count()
             self.using_parallel_model = True
         
-        self.input_ids, self.attention_masks = self.prepare_data()
-        self.dataset = TensorDataset(self.input_ids, self.attention_masks)
+        self.input_ids, self.attention_masks, self.entity_idx = self.prepare_data(sentences)
+        self.dataset = TensorDataset(self.input_ids, self.attention_masks, self.entity_idx)
 
         self.dataloader = DataLoader(
             self.dataset,
             sampler=SequentialSampler(self.dataset),
             batch_size=self.batch_size
         )
-        # self.entity_idx = self.get_entity_idx()
 
     @staticmethod
     def get_device():
@@ -63,10 +62,17 @@ class Classifier:
         model.resize_token_embeddings(len(self.tokenizer))
         return model
 
-    def prepare_data(self):
+    def prepare_data(self, sentences):
         input_ids = []
         attention_masks = []
-        for sent in self.sentences:
+        entity_idx = []
+        e1_tks_id = self.tokenizer.convert_tokens_to_ids('[E1]')
+        e2_tks_id = self.tokenizer.convert_tokens_to_ids('[E2]')
+        e2e_tks_id = self.tokenizer.convert_tokens_to_ids('[/E2]')
+        lastsent = None
+        brokensents_bar = tqdm(total=len(sentences),desc='broken sentences')
+        
+        for sent in tqdm(sentences,desc='preparing'):
             encoded_dict = self.tokenizer.encode_plus(
                 sent,                        # Sentence to encode.
                 add_special_tokens=True,     # Add '[CLS]' and '[SEP]'
@@ -76,26 +82,33 @@ class Classifier:
                 return_attention_mask=True,  # Construct attn. masks.
                 return_tensors='pt',         # Return pytorch tensors.
             )
+            input_id = encoded_dict['input_ids']
+            e1_idx = (input_id == e1_tks_id).nonzero(as_tuple=False)
+            e2_idx = (input_id == e2_tks_id).nonzero(as_tuple=False)
+            e2e_idx = (input_id == e2e_tks_id).nonzero(as_tuple=False)
+            if not len(e2e_idx): 
+                brokensents_bar.update(1)
+                if not len(e1_idx):
+                    e1_idx = [[0,0]]
+                if not len(e2_idx):
+                    e2_idx = [[0,0]]
+            entity_idx.append([e1_idx[0][1], e2_idx[0][1]])
             input_ids.append(encoded_dict['input_ids'])
             attention_masks.append(encoded_dict['attention_mask'])
+            lastsent = sent
+        brokensents_bar.close()
+
         input_ids = torch.cat(input_ids, dim=0)
         attention_masks = torch.cat(attention_masks, dim=0)
-        print('Original: ', self.sentences[0])
-        print('Token IDs:', input_ids[0])
-        return input_ids, attention_masks
+        entity_idx = torch.LongTensor(entity_idx)
+        print('Original: ', lastsent)
+        print('Token IDs:', input_ids[-1] if len(input_ids) else [])
+        print('Entity positions:', entity_idx[-1] if len(entity_idx) else [])
+        print('Evocab IDs',e1_tks_id,e2_tks_id)
+        print('WARN','broken sentences missing [E1] or [E2] may be represented as [CLS], [CLS].')
+        return input_ids, attention_masks, entity_idx
 
-    def get_entity_idx(self):
-        e1_tks_id = self.tokenizer.convert_tokens_to_ids('[E1]')
-        e2_tks_id = self.tokenizer.convert_tokens_to_ids('[E2]')
-        entity_idx = []
-        for input_id in self.input_ids:
-            e1_idx = (input_id == e1_tks_id).nonzero().flatten().tolist()[0]
-            e2_idx = (input_id == e2_tks_id).nonzero().flatten().tolist()[0]
-            entity_idx.append((e1_idx, e2_idx))
-        entity_idx = torch.Tensor(entity_idx)
-        return entity_idx
-
-    def get_hidden_state(self, verbose=2):
+    def get_hidden_state(self, *, verbose=2):
         self.model.eval()
         dataiter = self.dataloader
         outs = None
@@ -103,17 +116,21 @@ class Classifier:
         if verbose>=2:
             dataiter = tqdm(dataiter)
         with torch.no_grad():
-            for x,a in dataiter:
+            for x, a, epos in dataiter:
                 x = x.to(device=self.device)
                 a = a.to(device=self.device)
-                out = self.model(x, a)[1][-1].detach().cpu().numpy().flatten().reshape(x.shape[0], -1)
+                epos = epos.numpy()
+                out0 = self.model(x, a)[1][-1].detach().cpu().numpy()
+                out1 = np.array([v[p] for v,p in zip(out0,epos)])
+                out = out1.reshape(x.shape[0], -1)
+                
                 if outs is None:
                     outs = np.empty((len(self.dataset),out.shape[1]),dtype='float32' if not self.fp16 else 'float16')
                 outs[nouts:nouts+out.shape[0]] = out
                 nouts += out.shape[0]
         return outs
 
-    def train(self, labels):
+    def train(self, labels, *, verbose=2):
         labels = torch.tensor(labels).long()
         dataset = TensorDataset(self.input_ids, self.attention_masks, labels)
 
@@ -146,12 +163,15 @@ class Classifier:
         self.model.cuda()
         for epoch_i in range(0, epochs):
             print('======== Epoch {:} / {:} ========'.format(epoch_i + 1, epochs))
-            self.train_epoch()
+            self.train_epoch(verbose=verbose)
 
-    def train_epoch(self):
+    def train_epoch(self, *, verbose=2):
         total_train_loss = 0
         self.model.train()
-        for batch in self.train_dataloader:
+        dataiter = self.train_dataloader
+        if verbose>1:
+            dataiter=tqdm(dataiter,desc='train batch')
+        for batch in dataiter:
             b_input_ids = batch[0].to(self.device)
             b_input_mask = batch[1].to(self.device)
             b_labels = batch[2].to(self.device)

@@ -4,6 +4,7 @@ import yaml
 
 def main():
     config = yaml.load(open("config.yaml", "r"), Loader=yaml.FullLoader)
+    print(config)
     selfore = SelfORE(config)
     selfore.start()
     selfore.save(config['save_path'])

@@ -1,9 +1,9 @@
 fp16: 1
-batch_size: 16
+batch_size: 64
 k: 20
 cluster: 'minibatchkmeans'
 loop: 5
 epoch: 4
-sentence_path: 'data/triples.txt'
-bert_max_len: 128
-save_path: output
+sentence_path: 'data/triples.ann.E.16w.txt'
+bert_max_len: 48
+save_path: output-E-16w
