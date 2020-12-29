@@ -98,19 +98,20 @@ class Classifier:
     def get_hidden_state(self, verbose=2):
         self.model.eval()
         dataiter = self.dataloader
+        outs = None
+        nouts = 0
         if verbose>=2:
             dataiter = tqdm(dataiter)
         with torch.no_grad():
-            outputs = []
             for x,a in dataiter:
                 x = x.to(device=self.device)
                 a = a.to(device=self.device)
-                outputs += [
-                    self.model(x, a)[1][-1].detach().cpu().numpy().flatten().reshape(x.shape[0], -1)
-                ]
-                if self.fp16:
-                    outputs[-1]=outputs[-1].astype('float16')
-        return np.vstack(outputs)
+                out = self.model(x, a)[1][-1].detach().cpu().numpy().flatten().reshape(x.shape[0], -1)
+                if outs is None:
+                    outs = np.empty((len(self.dataset),out.shape[1]),dtype='float32' if not self.fp16 else 'float16')
+                outs[nouts:nouts+out.shape[0]] = out
+                nouts += out.shape[0]
+        return outs
 
     def train(self, labels):
         labels = torch.tensor(labels).long()
